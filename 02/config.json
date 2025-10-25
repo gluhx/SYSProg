@@ -6,7 +6,7 @@
                     "/var/log/vmware-vmsvc-root.log",
                     "/var/log/vmware-vmtoolsd-root.log"
     ], 
-    "target_dst" : "/home/gluhx/SYSprog/02/01/output", 
-    "cleanup_policy": "keep_newest", 
-    "n_to_keep" : 3
+    "target_dst" : "./output", 
+    "cleanup_policy": "keep_oldest", 
+    "n_to_keep" : 5
 }

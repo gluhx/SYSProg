@@ -2,7 +2,7 @@
 
 #строгий режим
 set -euo pipefail
-set -x
+#set -x
 
 #функция для вывода справки
 show_help() {
@@ -20,7 +20,6 @@ if [[ $# -lt 1 ]]; then show_help; fi
 CONFIG_FILE="$1"; shift
 
 #устанавливаем алгоритм для сжатия по умолчанию
-COMPRESSION_ALGO="gzip";
 COMPRESSION_CMD="gzip"
 
 
@@ -29,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -a|--algorithm)
             if [[ "$2" =~ ^(gzip|zstd|bzip2)$ ]]; then
-                COMPRESSION_ALGO="$2"; COMPRESSION_CMD="$2"
+                COMPRESSION_CMD="$2"
             else
                 echo "ОШИБКА: неподдерживаемый алгоритм '$2'" >&2; show_help 1
             fi 
@@ -52,8 +51,28 @@ fi
 #достаём параметры из конфига
 ARCHIVE_NAME=$(jq -r '.archive_stored_name // "log_rotator"' "$CONFIG_FILE")
 CLEANUP_POLICY=$(jq -r '.cleanup_policy // "keep_newest"' "$CONFIG_FILE")
-NUM_TO_KEEP=$(jq -r '.n_to_keep // 10' "$CONFIG_FILE")
+NUM=$(jq -r '.n_to_keep // 10' "$CONFIG_FILE")
 TARGET_DST_BASE=$(jq -r '.target_dst' "$CONFIG_FILE")
+
+NUM_TO_KEEP=$(( NUM - 1 ))
+
+#все архивы в директории сортируем согласно введённой политике
+mapfile -t ALL_ARCHIVES < <(
+    find "$TARGET_DST_BASE" -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.tar.zst" -o -name "*.tar.bz2" \) -printf '%f\n' | \
+    if [[ "$CLEANUP_POLICY" == "keep_newest" ]]; then
+        sort 
+    else
+        sort -r
+    fi
+)
+
+#вычисляем сколько архивов надо удалить
+TOTAL=${#ALL_ARCHIVES[@]};
+TO_DEL=$(( TOTAL - NUM_TO_KEEP > 0 ? TOTAL - NUM_TO_KEEP : 0 ))
+
+#удаляем архивы
+for ((i=0; i<TO_DEL; i++)); do rm -f "$TARGET_DST_BASE/${ALL_ARCHIVES[i]}"; done
+
 
 #фрмируем временный архив .tar
 TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
@@ -80,8 +99,6 @@ if [[ ${#SOURCE_PATHS[@]} -eq 0 ]]; then
     echo "ОШИБКА: не найдено ни одного корректного пути в target_src" >&2; exit 1
 fi
 
-
-
 #копируем во временную директорию каждый целевой файл
 for src in "${SOURCE_PATHS[@]}"; do cp -rL "$src" "$ARCHIVE_DIR/"; done
 
@@ -97,23 +114,10 @@ for src in "${SOURCE_PATHS[@]}"; do cp -rL "$src" "$ARCHIVE_DIR/"; done
 rm -rf "$ARCHIVE_DIR"
 
 
-#все архивы в директории сортируем согласно введённой политике
-mapfile -t ALL_ARCHIVES < <(
-    find "$TARGET_DST_BASE" -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.tar.zst" -o -name "*.tar.bz2" \) -printf '%f\n' | \
-    sort ${CLEANUP_POLICY=="keep_newest" && echo "-r"}
-)
-
-#вычисляем сколько архивов надо удалить
-TOTAL=${#ALL_ARCHIVES[@]}; 
-TO_DEL=$(( TOTAL - NUM_TO_KEEP > 0 ? TOTAL - NUM_TO_KEEP : 0 ))
-
-#удаляем архивы
-for ((i=0; i<TO_DEL; i++)); do rm -f "$TARGET_DST_BASE/${ALL_ARCHIVES[i]}"; done
-
 #очищаем файлы
 for src in "${SOURCE_PATHS[@]}"; do
     if [[ -f "$src" ]]; then rm -f "$src"; touch "$src"
     elif [[ -d "$src" ]]; then find "$src" -mindepth 1 -delete; fi
 done
 
-echo "Ротация логов завершена. Архив: $(basename "${ARCHIVE_TAR}.${COMPRESSION_ALGO}")"
+echo "Ротация логов завершена. Архив: $(basename "${ARCHIVE_TAR}.${COMPRESSION_CMD}")"
