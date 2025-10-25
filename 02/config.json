@@ -1,0 +1,12 @@
+{
+    "target_src" : ["/var/log/vmware-network.1.log", 
+                    "/var/log/vmware-network.log", 
+                    "/var/log/vmware-vmsvc-root.1.log",
+                    "/var/log/vmware-vmsvc-root.2.log",
+                    "/var/log/vmware-vmsvc-root.log",
+                    "/var/log/vmware-vmtoolsd-root.log"
+    ], 
+    "target_dst" : "/home/gluhx/SYSprog/02/01/output", 
+    "cleanup_policy": "keep_newest", 
+    "n_to_keep" : 3
+}
