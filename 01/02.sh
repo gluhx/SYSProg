@@ -80,7 +80,6 @@ add_user_to_files() {
 
     # Создаём базовые файлы, если их нет
     if [ ! -f "$home_dir/.bashrc" ]; then
-        echo "export PS1='\u@\h:\w\$ '" > "$home_dir/.bashrc"
         echo "source /etc/bash.bashrc" >> "$home_dir/.bashrc"
     fi
 
