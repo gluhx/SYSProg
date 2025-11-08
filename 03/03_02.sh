@@ -3,7 +3,7 @@
 # Функция обработки пришедшего сигнала
 signal_catched(){
     echo "Signal $1 $2 catched."
-    if [[ $1 == 5 ]]; then
+    if [[ $1 == 15 ]]; then
         exit 0
     fi
 }
@@ -29,8 +29,8 @@ done
 #чтобы убрать ограмный вывод в начале
 trap "signal_catched 17 CHLD" CHLD
 
-#прочерка SIGCHLD
-sleep 2&
+#проверка SIGCHLD
+#sleep 2&
 
 echo "START. Script PID: $$"
 
