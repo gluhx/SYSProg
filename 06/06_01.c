@@ -13,15 +13,6 @@ typedef struct {
     int count;
 } stack;
 
-// ✅ Прототипы — чтобы избежать implicit declaration
-stack* init(void);
-int push(stack *stk, int id, const char *login, const char *password);
-user copy_user(const user *src);
-int free_user(user *u);
-user pop(stack *stk);
-user peek(stack *stk);
-void freeStack(stack *stk);
-user search(stack *stk, const char *login);
 
 stack* init(void) {
     stack *stk = malloc(sizeof(stack));
@@ -34,6 +25,17 @@ stack* init(void) {
     return stk;
 }
 
+int free_user(user *u) {
+    if (!u) return 0;
+    free(u->id);
+    free(u->login);
+    free(u->password);
+    u->id = NULL;
+    u->login = NULL;
+    u->password = NULL;
+    return 1;
+}
+
 int push(stack *stk, int id, const char *login, const char *password) {
     if (!stk || !login || !password) return 0;
 
@@ -44,8 +46,8 @@ int push(stack *stk, int id, const char *login, const char *password) {
     }
     stk->top = new_top;
 
-    int idx = stk->count;
-    user *u = &stk->top[idx];
+    int i = stk->count;
+    user *u = &stk->top[i];
 
     u->id = malloc(sizeof(int));
     if (!u->id) return 0;
@@ -61,7 +63,6 @@ int push(stack *stk, int id, const char *login, const char *password) {
     return 1;
 }
 
-// ✅ Глубокое копирование
 user copy_user(const user *src) {
     if (!src) {
         user empty = {NULL, NULL, NULL};
@@ -80,27 +81,13 @@ user copy_user(const user *src) {
         dst.password = strdup(src->password);
     }
 
-    // Проверка: если что-то не скопировалось — очищаем и возвращаем пустого
     if ((!src->id || dst.id) && (!src->login || dst.login) && (!src->password || dst.password)) {
         return dst;
     }
 
-    // Что-то пошло не так — освобождаем частично созданный объект
     free_user(&dst);
     user empty = {NULL, NULL, NULL};
     return empty;
-}
-
-// ✅ Исправлено: отдельное обнуление каждого поля (без цепочки)
-int free_user(user *u) {
-    if (!u) return 0;
-    free(u->id);
-    free(u->login);
-    free(u->password);
-    u->id = NULL;
-    u->login = NULL;
-    u->password = NULL;
-    return 1;
 }
 
 user pop(stack *stk) {
@@ -110,11 +97,9 @@ user pop(stack *stk) {
     }
 
     stk->count--;
-    user u = stk->top[stk->count];       // получаем копию указателей
-    user result = copy_user(&u);          // создаём независимую копию данных
-    free_user(&stk->top[stk->count]);     // освобождаем оригинальные данные в стеке
+    user result = copy_user(&stk->top[stk->count]);
+    free_user(&stk->top[stk->count]);
 
-    // Сжимаем массив
     if (stk->count == 0) {
         free(stk->top);
         stk->top = NULL;
@@ -173,7 +158,6 @@ int main() {
     stack *stk = init();
     if (!stk) return 1;
 
-    printf("Стек инициализирован, count = %d\n", stk->count);
     print_help();
 
     char command[16];
@@ -189,6 +173,7 @@ int main() {
 
         if (strcmp(command, "exit") == 0) {
             break;
+
         } else if (strcmp(command, "push") == 0) {
             if (scanf("%255s %255s", login_input, pass_input) != 2) {
                 printf("Ошибка: команда 'push' требует два аргумента: <login> <password>\n");
@@ -198,6 +183,7 @@ int main() {
             if (!push(stk, stk->count, login_input, pass_input)) {
                 printf("Ошибка при добавлении элемента\n");
             }
+
         } else if (strcmp(command, "pop") == 0) {
             user u = pop(stk);
             if (u.id && u.login && u.password) {
@@ -206,6 +192,7 @@ int main() {
             } else {
                 printf("Стек пуст\n");
             }
+
         } else if (strcmp(command, "peek") == 0) {
             user u = peek(stk);
             if (u.id && u.login && u.password) {
@@ -214,6 +201,7 @@ int main() {
             } else {
                 printf("Стек пуст\n");
             }
+
         } else if (strcmp(command, "search") == 0) {
             if (scanf("%255s", login_input) != 1) {
                 printf("Ошибка: после 'search' должен быть логин\n");
@@ -227,8 +215,10 @@ int main() {
             } else {
                 printf("Пользователь с логином '%s' не найден\n", login_input);
             }
+
         } else if (strcmp(command, "help") == 0) {
             print_help();
+
         } else {
             printf("Неизвестная команда: '%s'\n", command);
             printf("Введите 'help' для просмотра доступных команд\n");
