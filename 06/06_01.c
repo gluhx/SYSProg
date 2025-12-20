@@ -154,6 +154,11 @@ void print_help(void) {
     printf("  help                    - показать справку\n\n");
 }
 
+void flush_input() {
+    int c;
+    while ((c = getchar()) != '\n' && c != ' ' && c != EOF);
+}
+
 int main() {
     stack *stk = init();
     if (!stk) return 1;
@@ -166,20 +171,28 @@ int main() {
 
     while (1) {
         printf("> ");
-        if (scanf("%15s", command) != 1) {
-            while (getchar() != '\n');
-            continue;
-        }
+        int res = scanf("%15s", command);
+        flush_input();  // ← всегда, даже если res != 1
+        if (res != 1) continue;
 
         if (strcmp(command, "exit") == 0) {
             break;
 
         } else if (strcmp(command, "push") == 0) {
-            if (scanf("%255s %255s", login_input, pass_input) != 2) {
+            res = scanf("%255s", login_input);
+            flush_input();  // ← всегда после scanf
+            if (res != 1) {
                 printf("Ошибка: команда 'push' требует два аргумента: <login> <password>\n");
-                while (getchar() != '\n');
                 continue;
             }
+
+            res = scanf("%255s", pass_input);
+            flush_input();  // ← всегда после scanf
+            if (res != 1) {
+                printf("Ошибка: команда 'push' требует два аргумента: <login> <password>\n");
+                continue;
+            }
+
             if (!push(stk, stk->count, login_input, pass_input)) {
                 printf("Ошибка при добавлении элемента\n");
             }
@@ -203,11 +216,13 @@ int main() {
             }
 
         } else if (strcmp(command, "search") == 0) {
-            if (scanf("%255s", login_input) != 1) {
+            res = scanf("%255s", login_input);
+            flush_input();  // ← всегда после scanf
+            if (res != 1) {
                 printf("Ошибка: после 'search' должен быть логин\n");
-                while (getchar() != '\n');
                 continue;
             }
+
             user u = search(stk, login_input);
             if (u.id && u.login && u.password) {
                 printf("ID: %d, login: %s, password: %s\n", *u.id, u.login, u.password);
@@ -223,8 +238,6 @@ int main() {
             printf("Неизвестная команда: '%s'\n", command);
             printf("Введите 'help' для просмотра доступных команд\n");
         }
-
-        while (getchar() != '\n');
     }
 
     freeStack(stk);

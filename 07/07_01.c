@@ -1,249 +1,426 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <ctype.h>
+#include <errno.h>
 
-// Функция для обмена элементов
-void swap(int *a, int *b) {
-    int temp = *a;
+char* get_tild_path(const char *path) {
+    if (path == NULL) return NULL;
+
+    if (path[0] != '~' || (path[1] != '/' && path[1] != '\0')) {
+        char *result = malloc(strlen(path) + 1);
+        if (result) strcpy(result, path);
+        return result;
+    }
+
+    char *home = getenv("HOME");
+    if (home == NULL) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+    }
+
+    if (home == NULL) {
+        return NULL;
+    }
+
+    size_t home_len = strlen(home);
+    size_t path_len = strlen(path + 1);
+    size_t total_len = home_len + path_len + 1;
+
+    char *full_path = malloc(total_len);
+    if (full_path == NULL) {
+        return NULL;
+    }
+
+    strcpy(full_path, home);
+
+    if (path_len > 0 && path[1] == '/' && home[home_len - 1] == '/') {
+        strcat(full_path, path + 2);
+    } else if (path_len > 0) {
+        strcat(full_path, path + 1);
+    }
+
+    return full_path;
+}
+
+int check_spec_symb(const char *path) {
+    if (path == NULL) return 0;
+    for (size_t i = 0; path[i] != '\0'; i++) {
+        char c = path[i];
+        if (c == '\n' || c == '\t' || c == '\r') return 0;
+    }
+    return 1;
+}
+
+static char* normalize_path(const char* path) {
+    if (path == NULL) return NULL;
+
+    size_t len = strlen(path);
+    char* normalized = malloc(len + 1);
+    if (!normalized) return NULL;
+
+    char** components = malloc((len + 1) * sizeof(char*));
+    if (!components) {
+        free(normalized);
+        return NULL;
+    }
+
+    int depth = 0;
+    const char* start = path;
+    const char* end = path;
+
+    while (*end != '\0') {
+        if (*start == '/') {
+            start++;
+            end++;
+            continue;
+        }
+
+        end = start;
+        while (*end != '\0' && *end != '/') end++;
+
+        size_t comp_len = end - start;
+        if (comp_len == 0) {
+            start = end;
+            continue;
+        }
+
+        char* component = malloc(comp_len + 1);
+        if (!component) {
+            for (int i = 0; i < depth; i++) free(components[i]);
+            free(components);
+            free(normalized);
+            return NULL;
+        }
+
+        strncpy(component, start, comp_len);
+        component[comp_len] = '\0';
+
+        if (strcmp(component, ".") == 0) {
+            free(component);
+        } else if (strcmp(component, "..") == 0) {
+            if (depth > 0) {
+                free(components[--depth]);
+            }
+            free(component);
+        } else {
+            components[depth++] = component;
+        }
+
+        start = end;
+    }
+
+    normalized[0] = '\0';
+
+    if (path[0] == '/' || depth == 0) {
+        strcpy(normalized, "/");
+    }
+
+    for (int i = 0; i < depth; i++) {
+        if (i > 0 || path[0] == '/') strcat(normalized, "/");
+        strcat(normalized, components[i]);
+        free(components[i]);
+    }
+
+    free(components);
+
+    if (normalized[0] == '\0') {
+        free(normalized);
+        char* root = malloc(2);
+        if (root) strcpy(root, "/");
+        return root;
+    }
+
+    return normalized;
+}
+
+char* make_absolute_path(const char* filepath) {
+    if (filepath == NULL) return NULL;
+
+    char *path = get_tild_path(filepath);
+    if (!path) return NULL;
+
+    if (path[0] == '/') {
+        char* result = malloc(strlen(path) + 1);
+        if (result) strcpy(result, path);
+        free(path);
+        return result;
+    }
+
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        free(path);
+        return NULL;
+    }
+
+    size_t cwd_len = strlen(cwd);
+    size_t path_len = strlen(path);
+    char* full_path = malloc(cwd_len + path_len + 2);
+    if (!full_path) {
+        free(path);
+        return NULL;
+    }
+
+    strcpy(full_path, cwd);
+    if (cwd[cwd_len - 1] != '/' && path[0] != '/') strcat(full_path, "/");
+    strcat(full_path, path);
+    free(path);
+
+    char* result = normalize_path(full_path);
+    free(full_path);
+    return result;
+}
+
+int check_file(const char *path) {
+    return path && (access(path, F_OK) == 0);
+}
+
+void swap_char(char *a, char *b) {
+    char t = *a;
     *a = *b;
-    *b = temp;
+    *b = t;
 }
 
-// Функция для преобразования в пирамиду (для сортировки по возрастанию)
-void heapify_min(int arr[], int n, int i) {
-    int smallest = i;
-    int left = 2 * i + 1;
-    int right = 2 * i + 2;
-
-    if (left < n && arr[left] < arr[smallest])
-        smallest = left;
-
-    if (right < n && arr[right] < arr[smallest])
-        smallest = right;
-
+void heapify_min_char(char arr[], int n, int i) {
+    int smallest = i, l = 2*i+1, r = 2*i+2;
+    if (l < n && arr[l] < arr[smallest]) smallest = l;
+    if (r < n && arr[r] < arr[smallest]) smallest = r;
     if (smallest != i) {
-        swap(&arr[i], &arr[smallest]);
-        heapify_min(arr, n, smallest);
+        swap_char(&arr[i], &arr[smallest]);
+        heapify_min_char(arr, n, smallest);
     }
 }
 
-// Функция для преобразования в пирамиду (для сортировки по убыванию)
-void heapify_max(int arr[], int n, int i) {
-    int largest = i;
-    int left = 2 * i + 1;
-    int right = 2 * i + 2;
-
-    if (left < n && arr[left] > arr[largest])
-        largest = left;
-
-    if (right < n && arr[right] > arr[largest])
-        largest = right;
-
+void heapify_max_char(char arr[], int n, int i) {
+    int largest = i, l = 2*i+1, r = 2*i+2;
+    if (l < n && arr[l] > arr[largest]) largest = l;
+    if (r < n && arr[r] > arr[largest]) largest = r;
     if (largest != i) {
-        swap(&arr[i], &arr[largest]);
-        heapify_max(arr, n, largest);
+        swap_char(&arr[i], &arr[largest]);
+        heapify_max_char(arr, n, largest);
     }
 }
 
-// Пирамидальная сортировка (Heap Sort)
-void heap_sort(int arr[], int n, int is_max_sort) {
-    // Построение кучи (перегруппировка массива)
-    for (int i = n / 2 - 1; i >= 0; i--) {
-        if (is_max_sort)
-            heapify_max(arr, n, i);
-        else
-            heapify_min(arr, n, i);
+void heap_sort_char(char arr[], int n, int is_max_sort) {
+    for (int i = n/2 - 1; i >= 0; i--) {
+        if (is_max_sort) heapify_max_char(arr, n, i);
+        else heapify_min_char(arr, n, i);
     }
-
-    // Извлечение элементов из кучи
-    for (int i = n - 1; i >= 0; i--) {
-        swap(&arr[0], &arr[i]);
-        
-        if (is_max_sort)
-            heapify_max(arr, i, 0);
-        else
-            heapify_min(arr, i, 0);
+    for (int i = n-1; i > 0; i--) {
+        swap_char(&arr[0], &arr[i]);
+        if (is_max_sort) heapify_max_char(arr, i, 0);
+        else heapify_min_char(arr, i, 0);
     }
 }
 
-// Функция для чтения массива из файла
-int* read_array_from_file(const char *filename, int *size) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        printf("Ошибка: не удалось открыть файл %s\n", filename);
+char* read_full_file(const char *filename, int *len_out) {
+    if (!len_out) {
+        fprintf(stderr, "Ошибка: len_out не должен быть NULL\n");
         return NULL;
     }
 
-    // Сначала подсчитаем количество чисел
-    int count = 0;
-    int temp;
-    while (fscanf(file, "%d", &temp) == 1) {
-        count++;
-    }
-    
-    if (count == 0) {
-        printf("Ошибка: файл пуст или не содержит чисел\n");
-        fclose(file);
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Ошибка открытия файла '%s': %s\n", filename, strerror(errno));
         return NULL;
     }
 
-    // Выделяем память под массив
-    int *arr = (int*)malloc(count * sizeof(int));
-    if (!arr) {
-        printf("Ошибка выделения памяти\n");
-        fclose(file);
+    long total_chars = 0;
+    char ch;
+    while ((ch = (char)fgetc(f)) != EOF) {
+        if (ch != '\n') {
+            total_chars++;
+        }
+    }
+
+    if (ferror(f)) {
+        fclose(f);
+        fprintf(stderr, "Ошибка чтения при подсчёте размера файла '%s'\n", filename);
         return NULL;
     }
 
-    // Возвращаемся в начало файла и читаем числа
-    rewind(file);
-    for (int i = 0; i < count; i++) {
-        fscanf(file, "%d", &arr[i]);
+    rewind(f);
+
+    char *buf = malloc((size_t)total_chars + 1);
+    if (!buf) {
+        fclose(f);
+        fprintf(stderr, "Недостаточно памяти для буфера размером %ld байт\n", total_chars + 1);
+        return NULL;
     }
 
-    fclose(file);
-    *size = count;
-    return arr;
+    size_t i = 0;
+    while ((ch = (char)fgetc(f)) != EOF) {
+        if (ch != '\n') {
+            buf[i++] = ch;
+        }
+    }
+
+    if (ferror(f)) {
+        free(buf);
+        fclose(f);
+        fprintf(stderr, "Ошибка чтения при копировании содержимого файла '%s'\n", filename);
+        return NULL;
+    }
+
+    buf[i] = '\0';
+    fclose(f);
+
+    *len_out = (int)total_chars;
+    return buf;
 }
 
-// Функция для записи массива в файл
-void write_array_to_file(const char *filename, int arr[], int size) {
-    FILE *file = fopen(filename, "w");
-    if (!file) {
-        printf("Ошибка: не удалось создать файл %s\n", filename);
+char* concat_remaining_args(int argc, char *argv[], int start, int *out_len) {
+    if (start >= argc) {
+        *out_len = 0;
+        return strdup("");
+    }
+
+    int total = 0;
+    for (int i = start; i < argc; i++) {
+        total += strlen(argv[i]);
+        if (i < argc - 1) total++;
+    }
+
+    char *res = malloc(total + 1);
+    if (!res) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    res[0] = '\0';
+    for (int i = start; i < argc; i++) {
+        if (i > start) strcat(res, " ");
+        strcat(res, argv[i]);
+    }
+
+    *out_len = total;
+    return res;
+}
+
+void print_and_save_result(const char *data, int len, int is_max_sort) {
+    if (!data || len <= 0) return;
+
+    char *sorted = malloc(len);
+    if (!sorted) {
+        fprintf(stderr, "Не удалось выделить память\n");
         return;
     }
+    memcpy(sorted, data, len);
+    heap_sort_char(sorted, len, is_max_sort);
 
-    for (int i = 0; i < size; i++) {
-        fprintf(file, "%d", arr[i]);
-        if (i < size - 1) {
-            fprintf(file, " ");
+    // Вывод в терминал: посимвольно
+    for (int i = 0; i < len; i++) {
+        putchar(sorted[i]);
+    }
+    putchar('\n');
+
+    // Запись в файл
+    FILE *f = fopen("output.txt", "w");
+    if (f) {
+        for (int i = 0; i < len; i++) {
+            fputc(sorted[i], f);
         }
+        fputc('\n', f);
+        fclose(f);
+        printf("Результат записан в output.txt\n");
+    } else {
+        perror("Не удалось записать output.txt");
     }
 
-    fclose(file);
-    printf("Результат записан в файл %s\n", filename);
+    free(sorted);
 }
 
-// Функция для вывода массива на экран
-void print_array(int arr[], int size) {
-    printf("Массив (%d элементов): ", size);
-    for (int i = 0; i < size; i++) {
-        printf("%d ", arr[i]);
-    }
-    printf("\n");
-}
-
-// Функция для чтения массива из строки
-int* read_array_from_string(const char *str, int *size) {
-    // Копируем строку для безопасной работы с strtok
-    char *input_copy = strdup(str);
-    if (!input_copy) {
-        printf("Ошибка выделения памяти\n");
-        return NULL;
-    }
-
-    // Подсчитываем количество чисел
-    int count = 0;
-    char *token = strtok(input_copy, " ");
-    while (token != NULL) {
-        count++;
-        token = strtok(NULL, " ");
-    }
-
-    if (count == 0) {
-        free(input_copy);
-        printf("Ошибка: строка не содержит чисел\n");
-        return NULL;
-    }
-
-    // Выделяем память под массив
-    int *arr = (int*)malloc(count * sizeof(int));
-    if (!arr) {
-        free(input_copy);
-        printf("Ошибка выделения памяти\n");
-        return NULL;
-    }
-
-    // Читаем числа из строки
-    strcpy(input_copy, str); // Восстанавливаем исходную строку
-    token = strtok(input_copy, " ");
-    for (int i = 0; i < count && token != NULL; i++) {
-        arr[i] = atoi(token);
-        token = strtok(NULL, " ");
-    }
-
-    free(input_copy);
-    *size = count;
-    return arr;
-}
 
 int main(int argc, char *argv[]) {
-    int *arr = NULL;
-    int size = 0;
-    int is_max_sort = 1; // По умолчанию сортировка по убыванию
-    char *filename = NULL;
-    char *input_string = NULL;
+    if (argc < 2) {
+        printf("Использование:\n");
+        printf("  %s [--max|--min] -f <путь>\n", argv[0]);
+        printf("  %s [--max|--min] <аргументы...>\n", argv[0]);
+        return 1;
+    }
 
-    // Обработка аргументов командной строки
+    int is_max_sort = 1;
+    char *filepath = NULL;
+    int data_start = 1;
+
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            filename = argv[i + 1];
-            i++;
-        } else if (strcmp(argv[i], "--max") == 0) {
-            is_max_sort = 1; // Сортировка по убыванию
+        if (strcmp(argv[i], "--max") == 0) {
+            is_max_sort = 1;
+            data_start = i + 1;
         } else if (strcmp(argv[i], "--min") == 0) {
-            is_max_sort = 0; // Сортировка по возрастанию
-        } else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
-            input_string = argv[i + 1];
-            i++;
-        } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Использование:\n");
-            printf("  %s -f <filename> [--max|--min]\n", argv[0]);
-            printf("  %s --input \"числа через пробел\" [--max|--min]\n", argv[0]);
-            printf("\nПараметры:\n");
-            printf("  -f <filename>    Чтение массива из файла\n");
-            printf("  --input \"строка\" Чтение массива из строки\n");
-            printf("  --max            Сортировка по убыванию (по умолчанию)\n");
-            printf("  --min            Сортировка по возрастанию\n");
-            printf("  --help           Вывод этой справки\n");
-            return 0;
+            is_max_sort = 0;
+            data_start = i + 1;
+        } else if (strcmp(argv[i], "-f") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Ошибка: после -f должен идти путь\n");
+                return 1;
+            }
+            filepath = argv[i + 1];
+            data_start = -1;
+            break;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "Неизвестный параметр: %s\n", argv[i]);
+            return 1;
+        } else {
+            data_start = i;
+            break;
         }
     }
 
-    // Чтение данных
-    if (filename) {
-        arr = read_array_from_file(filename, &size);
-    } else if (input_string) {
-        arr = read_array_from_string(input_string, &size);
+    char *data = NULL;
+    int len = 0;
+
+    if (filepath) {
+        char *abs_path = make_absolute_path(filepath);
+        if (!abs_path) {
+            fprintf(stderr, "Не удалось построить абсолютный путь\n");
+            return 1;
+        }
+
+        if (!check_spec_symb(abs_path)) {
+            fprintf(stderr, "Путь содержит запрещённые символы (\\n, \\t и др.)\n");
+            free(abs_path);
+            return 1;
+        }
+
+        if (!check_file(abs_path)) {
+            fprintf(stderr, "Файл не существует: %s\n", abs_path);
+            free(abs_path);
+            return 1;
+        }
+
+        data = read_full_file(abs_path, &len);
+        free(abs_path);
+        if (!data) return 1;
+
+        printf("Считано %d байт из файла\n", len);
+
     } else {
-        printf("Ошибка: не указан источник данных\n");
-        printf("Используйте -f для чтения из файла или --input для чтения из строки\n");
-        printf("Используйте --help для получения справки\n");
-        return 1;
+        if (data_start < 0 || data_start >= argc) {
+            fprintf(stderr, "Ошибка: не указаны данные\n");
+            return 1;
+        }
+
+        data = concat_remaining_args(argc, argv, data_start, &len);
+        if (!data) {
+            fprintf(stderr, "Ошибка выделения памяти\n");
+            return 1;
+        }
+
+        printf("Обработано %d символов из аргументов\n", len);
     }
 
-    if (!arr) {
-        return 1;
+    if (len == 0) {
+        printf("(пусто)\n");
+        free(data);
+        return 0;
     }
 
-    // Вывод исходного массива
-    printf("Исходный массив:\n");
-    print_array(arr, size);
+    print_and_save_result(data, len, is_max_sort);
 
-    // Сортировка
-    printf("Сортировка %s\n", is_max_sort ? "по убыванию (--max)" : "по возрастанию (--min)");
-    heap_sort(arr, size, is_max_sort);
-
-    // Вывод отсортированного массива
-    printf("Отсортированный массив:\n");
-    print_array(arr, size);
-
-    // Запись результата в файл
-    write_array_to_file("output.txt", arr, size);
-
-    // Освобождение памяти
-    free(arr);
-
+    free(data);
     return 0;
 }
