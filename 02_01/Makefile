@@ -4,6 +4,7 @@ all: 01_signal, 02_pipe, 03_socket
 	gcc -o 01_signal 01_signal.c 
 
 02_pipe:
+	rm -rf 02_pipe
 	gcc -o 02_pipe 02_pipe.c 
 
 03_socket:
