@@ -1,32 +1,32 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <termios.h>
-#include <sys/types.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <arpa/inet.h>
-#include <time.h>
 #include <signal.h>
+#include <time.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define MAX_BUFF 1024
 #define TIMEOUT_MS 100
-#define TCP_PORT 8888
-#define UDP_PORT 8889
-#define ICMP_ID 12345
 
-// Глобальные переменные для очистки
-static struct termios old_tio_global;
-static int old_tio_saved = 0;
+typedef struct {
+    int protocol;           // 1 - TCP, 2 - UDP, 3 - ICMP
+    char ip[256];           // IP адрес (если указан)
+    int port;               // Порт (для TCP/UDP)
+    int is_server;          // 1 - сервер, 0 - клиент
+} Arguments;
+
+static struct termios old_cmd_settings;
+static int flag_old_cmd_settings = 0;
 static int sock_fd = -1;
 static int server_fd = -1;
-static unsigned char global_key = 0;
-static int key_exchanged = 0;
+static unsigned char encryption_key = 0;
 
 void print_help() {
     printf("Используйте: program <protocol> [options]\n\n");
@@ -43,14 +43,79 @@ void print_help() {
     printf("  sudo program icmp 127.0.0.1   # ICMP отправка\n");
 }
 
-// Обработчик сигналов
-void signal_handler(int sig) {
-    if (old_tio_saved) {
-        tcsetattr(0, TCSANOW, &old_tio_global);
+int parse_arguments(int argc, char *argv[], Arguments *args) {
+    // Проверка минимального количества аргументов
+    if (argc < 2) {
+        printf("Ошибка: недостаточно аргументов\n");
+        return -1;
     }
-    if (sock_fd > 0) close(sock_fd);
-    if (server_fd > 0) close(server_fd);
-    exit(0);
+
+    // Инициализация структуры
+    memset(args, 0, sizeof(Arguments));
+    args->port = -1;  // Порт не указан
+
+    // Определение протокола
+    if (strcmp(argv[1], "tcp") == 0) {
+        args->protocol = 1;  // TCP
+    }
+    else if (strcmp(argv[1], "udp") == 0) {
+        args->protocol = 2;  // UDP
+    }
+    else if (strcmp(argv[1], "icmp") == 0) {
+        args->protocol = 3;  // ICMP
+    }
+    else {
+        printf("Ошибка: неизвестный протокол '%s'\n", argv[1]);
+        return -1;
+    }
+
+    // Парсинг аргументов в зависимости от протокола
+    if (args->protocol == 1 || args->protocol == 2) {  // TCP или UDP
+        if (argc == 3) {
+            // Формат: program <protocol> port (сервер)
+            args->port = atoi(argv[2]);
+            if (args->port <= 0 || args->port > 65535) {
+                printf("Ошибка: некорректный порт '%s'\n", argv[2]);
+                return -1;
+            }
+            args->is_server = 1;  // Сервер (свой IP не указан)
+        }
+        else if (argc == 4) {
+            // Формат: program <protocol> ip port (клиент)
+            strncpy(args->ip, argv[2], sizeof(args->ip) - 1);
+            args->ip[sizeof(args->ip) - 1] = '\0';
+
+            args->port = atoi(argv[3]);
+            if (args->port <= 0 || args->port > 65535) {
+                printf("Ошибка: некорректный порт '%s'\n", argv[3]);
+                return -1;
+            }
+            args->is_server = 0;  // Клиент (IP указан)
+        }
+        else {
+            printf("Ошибка: неверное количество аргументов для %s\n",
+                   args->protocol == 1 ? "TCP" : "UDP");
+            return -1;
+        }
+    }
+    else if (args->protocol == 3) {  // ICMP
+        if (argc == 2) {
+            // Формат: program icmp (сервер/ожидание)
+            args->is_server = 1;  // Режим ожидания
+        }
+        else if (argc == 3) {
+            // Формат: program icmp ip (клиент/отправка)
+            strncpy(args->ip, argv[2], sizeof(args->ip) - 1);
+            args->ip[sizeof(args->ip) - 1] = '\0';
+            args->is_server = 0;  // Режим отправки
+        }
+        else {
+            printf("Ошибка: неверное количество аргументов для ICMP\n");
+            return -1;
+        }
+    }
+
+    return 0;  // Успех
 }
 
 // Установка неблокирующего режима
@@ -60,767 +125,170 @@ int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+void cleanup_cmd() {
+    if (flag_old_cmd_settings) 
+        tcsetattr(0, TCSANOW, &old_cmd_settings);
+}
+
+void signal_handler(int sig) {
+    cleanup_cmd();
+    if (sock_fd > 0) close(sock_fd);
+    if (server_fd > 0) close(server_fd);
+    exit(0);
+}
+
 // Генерация случайного ключа
 unsigned char generate_key() {
     srand(time(NULL) ^ getpid());
     return 33 + (rand() % 94);
 }
 
-// XOR шифрование
-void xor_cipher(unsigned char *data, int len) {
-    for (int i = 0; i < len; i++) {
-        data[i] ^= global_key;
+// Функция для отправки зашифрованного сообщения
+int send_encrypted_msg(char *msg, int fd, unsigned char key) {
+    if (msg == NULL || fd < 0) return 1;
+    
+    int msg_len = strlen(msg);
+    char *encrypted = malloc(msg_len + 2); // +1 для \n и +1 для \0
+    if (encrypted == NULL) return 1;
+    
+    // Шифруем сообщение
+    for (int i = 0; i < msg_len; i++) {
+        encrypted[i] = msg[i] ^ key;
     }
+    encrypted[msg_len] = '\n';  // Добавляем \n без шифрования
+    encrypted[msg_len + 1] = '\0';
+    
+    ssize_t bytes_sent = send(fd, encrypted, msg_len + 1, 0);
+    free(encrypted);
+    
+    return (bytes_sent < 0) ? 1 : 0;
 }
 
-// Расчет контрольной суммы ICMP
-unsigned short icmp_checksum(unsigned short *buf, int len) {
-    unsigned long sum = 0;
-    while (len > 1) {
-        sum += *buf++;
-        len -= 2;
-    }
-    if (len == 1) {
-        sum += *(unsigned char *)buf;
-    }
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return ~sum;
-}
-
-// Функция для чтения строки из сокета
-char* read_line(int fd, char *buffer, int *buffer_len, 
-                struct sockaddr *addr, socklen_t *addr_len, int is_udp) {
+// Функция для чтения строки из сокета с расшифровкой
+char* read_line(int fd, char *buffer, int *buffer_len, unsigned char key) {
     static char leftover[MAX_BUFF * 2] = {0};
     static int leftover_len = 0;
     char temp[MAX_BUFF * 2];
-    
-    if (leftover_len > 0) {
-        memcpy(temp, leftover, leftover_len);
-    }
-    
-    int bytes;
-    if (is_udp && addr) {
-        bytes = recvfrom(fd, temp + leftover_len, MAX_BUFF - 1, 0, addr, addr_len);
-    } else {
-        bytes = recv(fd, temp + leftover_len, MAX_BUFF - 1, 0);
-    }
-    
-    if (bytes <= 0) {
-        if (bytes == 0 || (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            // Соединение закрыто или ошибка
-            return (char*)-1;  // Специальное значение для обозначения закрытия
-        }
-        return NULL;
-    }
-    
+
+    if (leftover_len > 0) memcpy(temp, leftover, leftover_len);
+
+    int bytes = read(fd, temp + leftover_len, MAX_BUFF - 1);
+    if (bytes <= 0) return NULL;
+
     int total_len = leftover_len + bytes;
     temp[total_len] = '\0';
-    
-    // Расшифровываем если ключ есть
-    if (key_exchanged) {
-        xor_cipher((unsigned char*)temp, total_len);
-    }
-    
+
     char *newline_ptr = strchr(temp, '\n');
     if (newline_ptr == NULL) {
-        // Нет полной строки - сохраняем в leftover
         memcpy(leftover, temp, total_len);
         leftover_len = total_len;
         return NULL;
     }
-    
-    // Есть полная строка
+
     int line_len = newline_ptr - temp;
     if (line_len >= *buffer_len) line_len = *buffer_len - 1;
-    
-    memcpy(buffer, temp, line_len);
+
+    // Расшифровываем строку (без \n)
+    for (int i = 0; i < line_len; i++) {
+        buffer[i] = temp[i] ^ key;
+    }
     buffer[line_len] = '\0';
     *buffer_len = line_len;
-    
-    // Обрабатываем остаток после новой строки
+
     int rest_len = total_len - (line_len + 1);
     if (rest_len > 0) {
+        // Остаток сохраняем как есть (зашифрованным)
         memcpy(leftover, newline_ptr + 1, rest_len);
         leftover_len = rest_len;
     } else {
         leftover_len = 0;
     }
-    
+
     return buffer;
 }
 
-// Отправка сообщения
-int send_message(int fd, const char *msg, 
-                 struct sockaddr *addr, socklen_t addr_len, int is_udp) {
-    unsigned char buffer[MAX_BUFF * 2];
-    int msg_len = strlen(msg);
-    
-    // Копируем сообщение
-    memcpy(buffer, msg, msg_len);
-    
-    // Добавляем символ новой строки
-    buffer[msg_len] = '\n';
-    msg_len++;
-    
-    // Шифруем (включая новую строку)
-    if (key_exchanged) {
-        xor_cipher(buffer, msg_len);
-    }
-    
-    int sent;
-    if (is_udp && addr) {
-        sent = sendto(fd, buffer, msg_len, 0, addr, addr_len);
-    } else {
-        sent = send(fd, buffer, msg_len, 0);
-    }
-    
-    if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-        return -1;  // Соединение закрыто
-    }
-    
-    return sent;
-}
-
-// Обмен ключом
-int exchange_key(int fd, int is_server, 
-                 struct sockaddr *peer_addr, socklen_t peer_addr_len, int is_udp) {
-    char key_msg[32];
-    
-    if (is_server) {
-        // Сервер генерирует и отправляет ключ
-        global_key = generate_key();
-        snprintf(key_msg, sizeof(key_msg), "KEY:%c\n", global_key);
-        
-        if (is_udp && peer_addr) {
-            sendto(fd, key_msg, strlen(key_msg), 0, peer_addr, peer_addr_len);
-        } else {
-            send(fd, key_msg, strlen(key_msg), 0);
-        }
-        
-        printf("[Ключ: %c]\n", global_key);
-        key_exchanged = 1;
-        return 0;
-    } else {
-        // Клиент ждет ключ
-        char buffer[32];
-        int bytes;
-        struct timeval tv = {5, 0};
-        fd_set read_fds;
-        
-        FD_ZERO(&read_fds);
-        FD_SET(fd, &read_fds);
-        
-        if (select(fd + 1, &read_fds, NULL, NULL, &tv) > 0) {
-            if (is_udp) {
-                struct sockaddr_in from;
-                socklen_t from_len = sizeof(from);
-                bytes = recvfrom(fd, buffer, sizeof(buffer) - 1, 0, 
-                                (struct sockaddr*)&from, &from_len);
-                if (peer_addr && bytes > 0) {
-                    memcpy(peer_addr, &from, sizeof(struct sockaddr_in));
-                }
-            } else {
-                bytes = recv(fd, buffer, sizeof(buffer) - 1, 0);
-            }
-            
-            if (bytes > 0) {
-                buffer[bytes] = '\0';
-                if (strncmp(buffer, "KEY:", 4) == 0) {
-                    global_key = buffer[4];
-                    printf("[Ключ: %c]\n", global_key);
-                    key_exchanged = 1;
-                    return 0;
-                }
-            }
-        }
-        printf("Ошибка обмена ключом\n");
-        return -1;
-    }
-}
-
-// Основная функция чата
-int chat_loop(int fd, pid_t my_pid, const char *protocol,
-              struct sockaddr *peer_addr, socklen_t peer_addr_len, int is_udp) {
+// Функция чата по TCP
+int tcp_chat(int fd, int is_server) {
     char input_buffer[MAX_BUFF] = {0};
-    char read_buffer[MAX_BUFF * 2] = {0};
+    char read_buffer[MAX_BUFF] = {0};
     int pos = 0;
-    
-    // Убеждаемся, что сокет в неблокирующем режиме
-    set_nonblocking(fd);
-    
-    printf("\n=== Чат через %s === (PID: %d)\n", protocol, my_pid);
-    if (key_exchanged) {
-        printf("Ключ шифрования: '%c'\n", global_key);
-    }
-    printf("> ");
-    fflush(stdout);
-    
-    while (1) {
-        fd_set read_fds;
-        struct timeval tv = {0, TIMEOUT_MS * 1000};
-        
-        FD_ZERO(&read_fds);
-        FD_SET(0, &read_fds);
-        FD_SET(fd, &read_fds);
-        
-        int max_fd = (fd > 0) ? fd : 0;
-        if (select(max_fd + 1, &read_fds, NULL, NULL, &tv) < 0) {
-            break;
-        }
-        
-        // Чтение из сокета
-        if (FD_ISSET(fd, &read_fds)) {
-            struct sockaddr_in from;
-            socklen_t from_len = sizeof(from);
-            struct sockaddr *recv_addr = is_udp ? (struct sockaddr*)&from : NULL;
-            socklen_t *recv_addr_len = is_udp ? &from_len : NULL;
-            
-            int buf_len = sizeof(read_buffer);
-            char *line = read_line(fd, read_buffer, &buf_len, 
-                                  recv_addr, recv_addr_len, is_udp);
-            
-            if (line == (char*)-1) {
-                // Соединение закрыто
-                printf("\nСоединение закрыто собеседником\n");
-                break;
-            }
-            
-            while (line != NULL && line != (char*)-1) {
-                // Для UDP обновляем адрес собеседника
-                if (is_udp && peer_addr && recv_addr) {
-                    memcpy(peer_addr, recv_addr, sizeof(struct sockaddr_in));
-                }
-                
-                // Пропускаем KEY сообщения
-                if (strncmp(line, "KEY:", 4) != 0) {
-                    char *colon = strchr(line, ':');
-                    if (colon != NULL) {
-                        *colon = '\0';
-                        pid_t sender = atoi(line);
-                        char *msg = colon + 1;
-                        
-                        if (sender != my_pid && strlen(msg) > 0) {
-                            printf("\r[Собеседник %d] %s\n> %s", sender, msg, input_buffer);
-                            fflush(stdout);
-                        }
-                    }
-                }
-                
-                buf_len = sizeof(read_buffer);
-                line = read_line(fd, read_buffer, &buf_len, 
-                               recv_addr, recv_addr_len, is_udp);
-                
-                if (line == (char*)-1) {
-                    printf("\nСоединение закрыто собеседником\n");
-                    break;
-                }
-            }
-        }
-        
-        // Чтение с клавиатуры
-        if (FD_ISSET(0, &read_fds)) {
-            char c;
-            if (read(0, &c, 1) == 1) {
-                if (c == '\n') {
-                    if (pos > 0) {
-                        input_buffer[pos] = '\0';
-                        
-                        // Форматируем сообщение с PID
-                        char msg_with_pid[MAX_BUFF * 2];
-                        snprintf(msg_with_pid, sizeof(msg_with_pid), "%d:%s", my_pid, input_buffer);
-                        
-                        // Отправляем
-                        int sent = send_message(fd, msg_with_pid, peer_addr, peer_addr_len, is_udp);
-                        
-                        if (sent < 0) {
-                            printf("\r[Ошибка отправки: соединение закрыто]\n");
-                            break;
-                        }
-                        
-                        printf("\r[Вы] %s\n> ", input_buffer);
-                        
-                        memset(input_buffer, 0, MAX_BUFF);
-                        pos = 0;
-                        fflush(stdout);
-                    } else {
-                        printf("\n> ");
-                        fflush(stdout);
-                    }
-                }
-                else if ((c == 127 || c == '\b') && pos > 0) {
-                    pos--;
-                    input_buffer[pos] = '\0';
-                    printf("\b \b");
-                    fflush(stdout);
-                }
-                else if (c != '\n' && c != '\r' && pos < MAX_BUFF - 1) {
-                    input_buffer[pos++] = c;
-                    putchar(c);
-                    fflush(stdout);
-                }
-            }
-        }
-    }
-    
-    return 0;
-}
+    char peer_name[20];
 
-// TCP режим
-int tcp_mode(char *ip, int port) {
-    struct sockaddr_in addr;
-    int is_server = (ip == NULL);
-    pid_t my_pid = getpid();
-    
+    // Определяем имя собеседника
     if (is_server) {
-        // Сервер
-        server_fd = socket(AF_INET, SOCK_STREAM, 0);
-        int opt = 1;
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-        
-        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            perror("bind");
-            return 1;
-        }
-        if (listen(server_fd, 1) < 0) {
-            perror("listen");
-            return 1;
-        }
-        
-        printf("TCP сервер (PID: %d) на порту %d\n", my_pid, port);
-        printf("Ожидание подключения...\n");
-        
-        struct sockaddr_in client;
-        socklen_t client_len = sizeof(client);
-        sock_fd = accept(server_fd, (struct sockaddr*)&client, &client_len);
-        if (sock_fd < 0) {
-            perror("accept");
-            return 1;
-        }
-        
-        printf("Клиент подключился: %s\n", inet_ntoa(client.sin_addr));
-        
-        if (exchange_key(sock_fd, 1, NULL, 0, 0) < 0) {
-            return 1;
-        }
-        
-        close(server_fd);
-        server_fd = -1;
-        
-        return chat_loop(sock_fd, my_pid, "TCP", NULL, 0, 0);
+        strcpy(peer_name, "Клиент");
     } else {
-        // Клиент
-        sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-        
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-            perror("inet_pton");
-            return 1;
-        }
-        
-        printf("Подключение к %s:%d...\n", ip, port);
-        if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            perror("connect");
-            return 1;
-        }
-        
-        printf("Подключено\n");
-        
-        if (exchange_key(sock_fd, 0, NULL, 0, 0) < 0) {
-            return 1;
-        }
-        
-        return chat_loop(sock_fd, my_pid, "TCP", NULL, 0, 0);
-    }
-}
-
-// UDP режим
-int udp_mode(char *ip, int port) {
-    struct sockaddr_in addr;
-    struct sockaddr_in peer_addr;
-    socklen_t peer_len = sizeof(peer_addr);
-    int is_server = (ip == NULL);
-    pid_t my_pid = getpid();
-    
-    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    
-    if (is_server) {
-        // Сервер
-        addr.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            perror("bind");
-            return 1;
-        }
-        
-        printf("UDP сервер (PID: %d) на порту %d\n", my_pid, port);
-        printf("Ожидание первого сообщения...\n");
-        
-        // Ждем первое сообщение
-        char buf[MAX_BUFF];
-        peer_len = sizeof(peer_addr);
-        int bytes = recvfrom(sock_fd, buf, sizeof(buf)-1, 0, 
-                            (struct sockaddr*)&peer_addr, &peer_len);
-        if (bytes < 0) {
-            perror("recvfrom");
-            return 1;
-        }
-        
-        buf[bytes] = '\0';
-        printf("Получено сообщение от %s:%d\n", 
-               inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
-        
-        if (exchange_key(sock_fd, 1, (struct sockaddr*)&peer_addr, peer_len, 1) < 0) {
-            return 1;
-        }
-        
-        return chat_loop(sock_fd, my_pid, "UDP", 
-                        (struct sockaddr*)&peer_addr, peer_len, 1);
-    } else {
-        // Клиент
-        if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-            perror("inet_pton");
-            return 1;
-        }
-        memcpy(&peer_addr, &addr, sizeof(peer_addr));
-        
-        printf("UDP клиент (PID: %d) готов к отправке на %s:%d\n", my_pid, ip, port);
-        
-        // Отправляем приветствие
-        sendto(sock_fd, "HELLO", 5, 0, (struct sockaddr*)&peer_addr, peer_len);
-        
-        if (exchange_key(sock_fd, 0, (struct sockaddr*)&peer_addr, peer_len, 1) < 0) {
-            return 1;
-        }
-        
-        return chat_loop(sock_fd, my_pid, "UDP", 
-                        (struct sockaddr*)&peer_addr, peer_len, 1);
-    }
-}
-
-// ICMP режим
-int icmp_mode(char *ip) {
-    int is_server = (ip == NULL);
-    pid_t my_pid = getpid();
-    struct sockaddr_in peer_addr;
-    socklen_t peer_len = sizeof(peer_addr);
-    int seq = 1;
-    int key_exchanged_local = 0;  // Локальная переменная для отслеживания обмена ключом
-
-    // Создаем RAW сокет
-    sock_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (sock_fd < 0) {
-        perror("socket");
-        printf("Для ICMP нужны root-права (запустите с sudo)\n");
-        return 1;
-    }
-
-    // Устанавливаем таймаут для recvfrom
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (is_server) {
-        // Сервер (ожидание)
-        printf("ICMP сервер (PID: %d) ожидает...\n", my_pid);
-        printf("Ожидание ICMP echo запроса...\n");
-
-        // Ждем первый ping
-        unsigned char buf[4096];
-        struct sockaddr_in src;
-        socklen_t src_len = sizeof(src);
-        
-        int bytes = recvfrom(sock_fd, buf, sizeof(buf), 0,
-                            (struct sockaddr*)&src, &src_len);
-        if (bytes < 0) {
-            perror("recvfrom");
-            return 1;
-        }
-
-        struct iphdr *ip_hdr = (struct iphdr *)buf;
-        int ip_header_len = ip_hdr->ihl * 4;
-        struct icmphdr *icmp = (struct icmphdr *)(buf + ip_header_len);
-
-        // Проверяем, что это ICMP echo запрос
-        if (icmp->type == ICMP_ECHO) {
-            memcpy(&peer_addr, &src, sizeof(peer_addr));
-            printf("Получен ping от %s\n", inet_ntoa(peer_addr.sin_addr));
-
-            // Генерируем и отправляем ключ
-            global_key = generate_key();
-            key_exchanged = 1;
-            key_exchanged_local = 1;
-            printf("[Ключ шифрования: %c (ASCII: %d)]\n", global_key, global_key);
-
-            // Отправляем ключ в ICMP echo reply
-            unsigned char packet[4096];
-            struct icmphdr *resp_icmp = (struct icmphdr *)packet;
-            char *data = (char *)(packet + sizeof(struct icmphdr));
-
-            memset(packet, 0, sizeof(packet));
-            resp_icmp->type = ICMP_ECHOREPLY;
-            resp_icmp->code = 0;
-            resp_icmp->un.echo.id = htons(ICMP_ID);
-            resp_icmp->un.echo.sequence = htons(seq++);
-
-            // Формируем сообщение с ключом
-            snprintf(data, 100, "KEY:%c", global_key);
-            int data_len = strlen(data);
-            
-            // Вычисляем контрольную сумму
-            resp_icmp->checksum = 0;
-            resp_icmp->checksum = icmp_checksum((unsigned short *)resp_icmp,
-                                               sizeof(struct icmphdr) + data_len);
-
-            // Отправляем ответ
-            int sent = sendto(sock_fd, packet, sizeof(struct icmphdr) + data_len, 0,
-                            (struct sockaddr*)&peer_addr, sizeof(peer_addr));
-            if (sent < 0) {
-                perror("sendto");
-                return 1;
-            }
-            printf("Ключ отправлен\n");
-        }
-    } else {
-        // Клиент (отправка)
-        memset(&peer_addr, 0, sizeof(peer_addr));
-        peer_addr.sin_family = AF_INET;
-        peer_addr.sin_addr.s_addr = inet_addr(ip);
-
-        printf("ICMP клиент (PID: %d) отправляет ping на %s\n", my_pid, ip);
-
-        // Отправляем первый ping
-        unsigned char packet[4096];
-        struct icmphdr *icmp = (struct icmphdr *)packet;
-
-        memset(packet, 0, sizeof(packet));
-        icmp->type = ICMP_ECHO;
-        icmp->code = 0;
-        icmp->un.echo.id = htons(ICMP_ID);
-        icmp->un.echo.sequence = htons(seq++);
-        icmp->checksum = icmp_checksum((unsigned short *)icmp, sizeof(struct icmphdr));
-
-        int sent = sendto(sock_fd, packet, sizeof(struct icmphdr), 0,
-                         (struct sockaddr*)&peer_addr, sizeof(peer_addr));
-        if (sent < 0) {
-            perror("sendto");
-            return 1;
-        }
-        printf("Ping отправлен, ожидание ответа с ключом...\n");
-
-        // Ждем ключ
-        int key_received = 0;
-        for (int attempt = 0; attempt < 5 && !key_received; attempt++) {
-            unsigned char buf[4096];
-            struct sockaddr_in src;
-            socklen_t src_len = sizeof(src);
-
-            int bytes = recvfrom(sock_fd, buf, sizeof(buf), 0,
-                                (struct sockaddr*)&src, &src_len);
-            if (bytes > 0) {
-                struct iphdr *ip_hdr = (struct iphdr *)buf;
-                int ip_header_len = ip_hdr->ihl * 4;
-                struct icmphdr *resp_icmp = (struct icmphdr *)(buf + ip_header_len);
-                
-                // Проверяем, что это ответ на наш ping
-                if (resp_icmp->type == ICMP_ECHOREPLY && 
-                    ntohs(resp_icmp->un.echo.id) == ICMP_ID) {
-                    
-                    char *data = (char *)(buf + ip_header_len + sizeof(struct icmphdr));
-                    int data_len = bytes - ip_header_len - sizeof(struct icmphdr);
-                    
-                    if (data_len > 0 && strncmp(data, "KEY:", 4) == 0) {
-                        global_key = data[4];
-                        key_exchanged = 1;
-                        key_exchanged_local = 1;
-                        key_received = 1;
-                        printf("[Ключ шифрования получен: %c (ASCII: %d)]\n", global_key, global_key);
-                        break;
-                    }
-                }
-            }
-        }
-        
-        if (!key_received) {
-            printf("Не удалось получить ключ от сервера\n");
-            return 1;
-        }
+        strcpy(peer_name, "Сервер");
     }
 
     // Устанавливаем неблокирующий режим для сокета
-    set_nonblocking(sock_fd);
+    set_nonblocking(fd);
 
-    // Основной цикл чата
-    char input_buffer[MAX_BUFF] = {0};
-    char display_buffer[MAX_BUFF] = {0};  // Для отображения введенного текста
-    int pos = 0;
-
-    printf("\n=== Чат через ICMP === (PID: %d)\n", my_pid);
-    printf("Ключ шифрования: '%c' (ASCII: %d)\n", global_key, global_key);
-    printf("Для выхода используйте Ctrl+C\n");
+    printf("\n=== Чат начат ===\n");
     printf("> ");
     fflush(stdout);
 
     while (1) {
         fd_set read_fds;
-        struct timeval tv_select;
-        tv_select.tv_sec = 0;
-        tv_select.tv_usec = TIMEOUT_MS * 1000;
+        struct timeval tv = {0, TIMEOUT_MS * 1000};
 
         FD_ZERO(&read_fds);
-        FD_SET(0, &read_fds);
-        FD_SET(sock_fd, &read_fds);
+        FD_SET(0, &read_fds);      // stdin
+        FD_SET(fd, &read_fds);      // сокет
 
-        int max_fd = (sock_fd > 0) ? sock_fd : 0;
-        if (select(max_fd + 1, &read_fds, NULL, NULL, &tv_select) < 0) {
+        int max_fd = (fd > 0) ? fd : 0;
+
+        if (select(max_fd + 1, &read_fds, NULL, NULL, &tv) < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        // Чтение ICMP пакетов
-        if (FD_ISSET(sock_fd, &read_fds)) {
-            unsigned char buf[4096];
-            struct sockaddr_in src;
-            socklen_t src_len = sizeof(src);
-
-            int bytes = recvfrom(sock_fd, buf, sizeof(buf), 0,
-                                (struct sockaddr*)&src, &src_len);
-
-            if (bytes > 0) {
-                struct iphdr *ip_hdr = (struct iphdr *)buf;
-                int ip_header_len = ip_hdr->ihl * 4;
-                struct icmphdr *icmp = (struct icmphdr *)(buf + ip_header_len);
-
-                // Проверяем, что пакет принадлежит нашему чату
-                if (ntohs(icmp->un.echo.id) == ICMP_ID) {
-                    char *data = (char *)(buf + ip_header_len + sizeof(struct icmphdr));
-                    int data_len = bytes - ip_header_len - sizeof(struct icmphdr);
-
-                    if (data_len > 0) {
-                        // Для сервера обновляем адрес собеседника при получении echo запроса
-                        if (is_server && icmp->type == ICMP_ECHO) {
-                            memcpy(&peer_addr, &src, sizeof(peer_addr));
-                            peer_len = sizeof(peer_addr);
-                        }
-
-                        // Копируем данные во временный буфер для расшифровки
-                        unsigned char temp_data[MAX_BUFF * 2];
-                        memcpy(temp_data, data, data_len);
-                        temp_data[data_len] = '\0';
-
-                        // Расшифровываем если ключ есть
-                        if (key_exchanged) {
-                            xor_cipher(temp_data, data_len);
-                        }
-
-                        // Пропускаем KEY сообщения
-                        if (strncmp((char*)temp_data, "KEY:", 4) != 0) {
-                            char *colon = strchr((char*)temp_data, ':');
-                            if (colon != NULL) {
-                                *colon = '\0';
-                                pid_t sender = atoi((char*)temp_data);
-                                char *msg = colon + 1;
-
-                                if (sender != my_pid && strlen(msg) > 0) {
-                                    // Очищаем текущую строку ввода
-                                    printf("\r\033[K");
-                                    printf("[Собеседник %d] %s\n", sender, msg);
-                                    printf("> %s", input_buffer);
-                                    fflush(stdout);
-                                }
-                            }
-                        }
-                    }
+        // Проверяем данные от собеседника
+        if (FD_ISSET(fd, &read_fds)) {
+            int buf_len = sizeof(read_buffer);
+            char *line = read_line(fd, read_buffer, &buf_len, encryption_key);
+            
+            while (line != NULL) {
+                if (strlen(line) > 0) {
+                    printf("\r[%s] %s\n> %s", peer_name, line, input_buffer);
+                    fflush(stdout);
                 }
+                buf_len = sizeof(read_buffer);
+                line = read_line(fd, read_buffer, &buf_len, encryption_key);
+            }
+            
+            // Проверяем, не закрыл ли собеседник соединение
+            if (buf_len == 0) {
+                printf("\nСобеседник закрыл соединение. Выход...\n");
+                break;
             }
         }
 
-        // Чтение с клавиатуры
+        // Проверяем ввод с клавиатуры
         if (FD_ISSET(0, &read_fds)) {
             char c;
             if (read(0, &c, 1) == 1) {
-                if (c == '\n') {
-                    if (pos > 0) {
-                        input_buffer[pos] = '\0';
-
-                        // Формируем сообщение с PID
-                        char msg_with_pid[MAX_BUFF * 2];
-                        int msg_len = snprintf(msg_with_pid, sizeof(msg_with_pid),
-                                             "%d:%s", my_pid, input_buffer);
-
-                        // Отображаем свое сообщение
-                        printf("\r\033[K");
-                        printf("[Вы] %s\n", input_buffer);
-
-                        // Создаем ICMP пакет
-                        unsigned char packet[4096];
-                        struct icmphdr *icmp = (struct icmphdr *)packet;
-                        char *data = (char *)(packet + sizeof(struct icmphdr));
-
-                        memset(packet, 0, sizeof(packet));
-                        
-                        // Определяем тип ICMP пакета
-                        if (is_server) {
-                            icmp->type = ICMP_ECHOREPLY;  // Сервер отвечает
-                        } else {
-                            icmp->type = ICMP_ECHO;       // Клиент отправляет запрос
-                        }
-                        
-                        icmp->code = 0;
-                        icmp->un.echo.id = htons(ICMP_ID);
-                        icmp->un.echo.sequence = htons(seq++);
-
-                        // Копируем и шифруем сообщение
-                        memcpy(data, msg_with_pid, msg_len);
-                        if (key_exchanged) {
-                            xor_cipher((unsigned char*)data, msg_len);
-                        }
-
-                        // Вычисляем контрольную сумму
-                        icmp->checksum = 0;
-                        icmp->checksum = icmp_checksum((unsigned short *)icmp,
-                                                       sizeof(struct icmphdr) + msg_len);
-
-                        // Отправляем пакет
-                        int sent = sendto(sock_fd, packet, sizeof(struct icmphdr) + msg_len, 0,
-                                        (struct sockaddr*)&peer_addr, sizeof(peer_addr));
-                        
-                        if (sent < 0) {
-                            printf("Ошибка отправки ICMP пакета: %s\n", strerror(errno));
-                        }
-
-                        // Очищаем буфер ввода
-                        memset(input_buffer, 0, MAX_BUFF);
-                        pos = 0;
-                        printf("> ");
-                        fflush(stdout);
+                if (c == '\n' && pos > 0) {
+                    // Отправляем зашифрованное сообщение
+                    if (send_encrypted_msg(input_buffer, fd, encryption_key) == 0) {
+                        printf("\r[Вы] %s\n> ", input_buffer);
                     } else {
-                        printf("\n> ");
-                        fflush(stdout);
+                        printf("\r[Ошибка отправки]\n> ");
                     }
-                }
+                    
+                    memset(input_buffer, 0, MAX_BUFF);
+                    pos = 0;
+                } 
                 else if ((c == 127 || c == '\b') && pos > 0) {
                     pos--;
                     input_buffer[pos] = '\0';
                     printf("\b \b");
-                    fflush(stdout);
-                }
-                else if (c >= 32 && c < 127 && pos < MAX_BUFF - 1) {  // Только печатные символы
+                } 
+                else if (c != '\n' && pos < MAX_BUFF - 1) {
                     input_buffer[pos++] = c;
                     putchar(c);
-                    fflush(stdout);
                 }
+                fflush(stdout);
             }
         }
     }
@@ -828,86 +296,199 @@ int icmp_mode(char *ip) {
     return 0;
 }
 
-// Инициализация терминала
-int init_terminal(struct termios *old, struct termios *new) {
-    tcgetattr(0, old);
-    *new = *old;
-    new->c_lflag &= ~(ICANON | ECHO);
-    new->c_cc[VMIN] = 1;
-    new->c_cc[VTIME] = 0;
-    return tcsetattr(0, TCSANOW, new);
+// Функция для серверного режима TCP
+int tcp_server_mode(int port, unsigned char key) {
+    struct sockaddr_in address;
+    int opt = 1;
+    
+    // Создание сокета
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        fprintf(stderr, "Ошибка создания сокета\n");
+        return -1;
+    }
+    
+    // Настройка опций сокета
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        fprintf(stderr, "Ошибка setsockopt\n");
+        close(server_fd);
+        return -1;
+    }
+    
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    
+    // Привязка сокета
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        fprintf(stderr, "Ошибка bind\n");
+        close(server_fd);
+        return -1;
+    }
+    
+    // Ожидание подключений
+    if (listen(server_fd, 1) < 0) {
+        fprintf(stderr, "Ошибка listen\n");
+        close(server_fd);
+        return -1;
+    }
+    
+    printf("TCP сервер запущен на порту %d. Ожидание подключения...\n", port);
+    
+    // Принимаем подключение
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    
+    sock_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+    if (sock_fd < 0) {
+        fprintf(stderr, "Ошибка accept\n");
+        close(server_fd);
+        return -1;
+    }
+    
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+    printf("Клиент подключился: %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+    
+    // Отправляем ключ шифрования клиенту
+    if (send(sock_fd, &key, 1, 0) < 0) {
+        fprintf(stderr, "Ошибка отправки ключа\n");
+        close(sock_fd);
+        close(server_fd);
+        return -1;
+    }
+    
+    printf("Ключ шифрования отправлен клиенту\n");
+    
+    // Закрываем серверный сокет, он больше не нужен
+    close(server_fd);
+    server_fd = -1;
+    
+    // Запускаем чат
+    encryption_key = key;
+    tcp_chat(sock_fd, 1);
+    
+    close(sock_fd);
+    sock_fd = -1;
+    return 0;
+}
+
+// Функция для клиентского режима TCP
+int tcp_client_mode(const char* server_ip, int port) {
+    struct sockaddr_in server_addr;
+    unsigned char key;
+    
+    // Создание сокета
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        fprintf(stderr, "Ошибка создания сокета\n");
+        return -1;
+    }
+    
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    
+    // Преобразование IP адреса
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Ошибка: некорректный IP адрес %s\n", server_ip);
+        close(sock_fd);
+        return -1;
+    }
+    
+    // Подключение к серверу
+    printf("Подключение к серверу %s:%d...\n", server_ip, port);
+    if (connect(sock_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        fprintf(stderr, "Ошибка подключения к серверу\n");
+        close(sock_fd);
+        return -1;
+    }
+    
+    printf("Успешно подключено к серверу\n");
+    
+    // Получение ключа от сервера
+    if (recv(sock_fd, &key, 1, 0) < 0) {
+        fprintf(stderr, "Ошибка при получении ключа\n");
+        close(sock_fd);
+        return -1;
+    }
+    
+    printf("Получен ключ шифрования: %c (код %d)\n", key, key);
+    
+    // Запускаем чат
+    encryption_key = key;
+    tcp_chat(sock_fd, 0);
+    
+    close(sock_fd);
+    sock_fd = -1;
+    return 0;
+}
+
+// Основная функция для TCP режима
+int handle_tcp_mode(Arguments *args) {
+    unsigned char key;
+    
+    if (args->is_server) {
+        // Серверный режим - генерируем ключ
+        key = generate_key();
+        printf("Сгенерирован ключ шифрования: %c (код %d)\n", key, key);
+        return tcp_server_mode(args->port, key);
+    } else {
+        // Клиентский режим
+        return tcp_client_mode(args->ip, args->port);
+    }
+}
+
+// Заглушка для UDP режима
+int handle_udp_mode(Arguments *args) {
+    printf("UDP режим пока не реализован\n");
+    return 1;
+}
+
+// Заглушка для ICMP режима
+int handle_icmp_mode(Arguments *args) {
+    printf("ICMP режим пока не реализован\n");
+    return 1;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        print_help();
-        return 0;
-    }
+    Arguments args;
     
-    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
-        print_help();
-        return 0;
-    }
-    
-    // Сохраняем настройки терминала
-    tcgetattr(0, &old_tio_global);
-    old_tio_saved = 1;
-    
-    // Устанавливаем обработчики сигналов
+    // Установка обработчиков сигналов
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGQUIT, signal_handler);
     
-    // Настройка терминала
-    struct termios new_tio;
-    if (init_terminal(&old_tio_global, &new_tio) != 0) {
-        fprintf(stderr, "Ошибка инициализации терминала\n");
+    if (parse_arguments(argc, argv, &args) < 0) {
+        print_help();
         return 1;
     }
     
-    char *proto = argv[1];
+    // Настройка терминала для неканонического режима
+    struct termios new_tio;
+    tcgetattr(0, &old_cmd_settings);
+    flag_old_cmd_settings = 1;
+    
+    new_tio = old_cmd_settings;
+    new_tio.c_lflag &= ~(ICANON | ECHO);
+    new_tio.c_cc[VMIN] = 1;
+    new_tio.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &new_tio);
+    
     int result = 0;
     
-    if (strcmp(proto, "tcp") == 0) {
-        if (argc == 3) {
-            result = tcp_mode(NULL, atoi(argv[2]));
-        } else if (argc == 4) {
-            result = tcp_mode(argv[2], atoi(argv[3]));
-        } else {
-            print_help();
-            result = 1;
-        }
-    }
-    else if (strcmp(proto, "udp") == 0) {
-        if (argc == 3) {
-            result = udp_mode(NULL, atoi(argv[2]));
-        } else if (argc == 4) {
-            result = udp_mode(argv[2], atoi(argv[3]));
-        } else {
-            print_help();
-            result = 1;
-        }
-    }
-    else if (strcmp(proto, "icmp") == 0) {
-        if (argc == 2) {
-            result = icmp_mode(NULL);
-        } else if (argc == 3) {
-            result = icmp_mode(argv[2]);
-        } else {
-            print_help();
-            result = 1;
-        }
-    }
-    else {
-        print_help();
-        result = 1;
+    // Выбор режима работы на основе протокола
+    if (args.protocol == 1) {  // TCP
+        result = handle_tcp_mode(&args);
+    } else if (args.protocol == 2) {  // UDP
+        result = handle_udp_mode(&args);
+    } else if (args.protocol == 3) {  // ICMP
+        result = handle_icmp_mode(&args);
     }
     
-    // Восстанавливаем терминал
-    if (old_tio_saved) {
-        tcsetattr(0, TCSANOW, &old_tio_global);
-    }
+    // Восстановление настроек терминала
+    cleanup_cmd();
     
+    // Закрытие открытых сокетов
     if (sock_fd > 0) close(sock_fd);
     if (server_fd > 0) close(server_fd);
     
