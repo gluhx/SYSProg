@@ -1,0 +1,1 @@
+savedcmd_kernel_hello.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T /home/gluhx/kernel-build/linux-6.17.3/scripts/module.lds -o kernel_hello.ko kernel_hello.o kernel_hello.mod.o .module-common.o

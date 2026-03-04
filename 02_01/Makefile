@@ -1,4 +1,4 @@
-all: 01_signal, 02_pipe, 03_socket
+all: 01_signal, 02_pipe, 03_tcp, 03_udp, 03_icmp
 
 01_signal:
 	gcc -o 01_signal 01_signal.c 
@@ -7,8 +7,14 @@ all: 01_signal, 02_pipe, 03_socket
 	rm -rf 02_pipe
 	gcc -o 02_pipe 02_pipe.c 
 
-03_socket:
-	gcc -o 03_socket 03_socket.c 
+03_tcp:
+	gcc -o 03_tcp 03_tcp.c 
+
+03_udp:
+	gcc -o 03_udp 03_udp.c 
+
+03_icmp:
+	gcc -o 03_icmp 03_icmp.c 
 
 clean:
-	rm -rf 01_signal 02_pipe 03_socket
+	rm -rf 01_signal 02_pipe 03_tcp 03_udp 03_icmp
