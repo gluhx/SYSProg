@@ -1,0 +1,1 @@
+savedcmd_dev_crypto_wallet.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T /home/gluhx/kernel-build/linux-6.17.3/scripts/module.lds -o dev_crypto_wallet.ko dev_crypto_wallet.o dev_crypto_wallet.mod.o .module-common.o
